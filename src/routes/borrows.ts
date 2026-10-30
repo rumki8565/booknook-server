@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { ObjectId } from "mongodb";
 import { getBooksCollection, getBorrowsCollection } from "../db";
+import { verifyToken } from "../middleware/auth";
 import { Borrow } from "../types";
 import { handleError, isValidId, sendError } from "../utils";
 
@@ -8,25 +9,21 @@ const router = Router();
 
 const BORROW_DAYS: number = 7;
 
+// Every borrow route needs a valid token
+router.use(verifyToken);
+
 // POST /borrows
 router.post("/", async (req: Request, res: Response): Promise<void> => {
   try {
-    const { bookId, userName, userEmail } = (req.body ?? {}) as Record<
-      string,
-      unknown
-    >;
-
-    if (typeof bookId !== "string" || !isValidId(bookId)) {
-      sendError(res, 400, "Invalid book id");
+    const user = req.user;
+    if (!user) {
+      sendError(res, 401, "Unauthorized");
       return;
     }
-    if (
-      typeof userName !== "string" ||
-      !userName.trim() ||
-      typeof userEmail !== "string" ||
-      !userEmail.trim()
-    ) {
-      sendError(res, 400, "User name and email are required");
+
+    const { bookId } = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof bookId !== "string" || !isValidId(bookId)) {
+      sendError(res, 400, "Invalid book id");
       return;
     }
 
@@ -34,17 +31,15 @@ router.post("/", async (req: Request, res: Response): Promise<void> => {
     const borrows = getBorrowsCollection();
     const bookObjectId = new ObjectId(bookId);
 
-    // No double borrow: a borrow record exists only while the book is still borrowed
     const alreadyBorrowed = await borrows.findOne({
       bookId: bookObjectId,
-      userEmail,
+      userEmail: user.email,
     });
     if (alreadyBorrowed) {
       sendError(res, 409, "You have already borrowed this book");
       return;
     }
 
-    // Decrease copies by 1 only if at least one copy is available
     const book = await books.findOneAndUpdate(
       { _id: bookObjectId, availableCopies: { $gt: 0 } },
       { $inc: { availableCopies: -1 } },
@@ -69,8 +64,8 @@ router.post("/", async (req: Request, res: Response): Promise<void> => {
       bookId: bookObjectId,
       bookTitle: book.title,
       bookImage: book.image,
-      userName: userName.trim(),
-      userEmail: userEmail.trim(),
+      userName: user.name,
+      userEmail: user.email,
       borrowDate,
       returnDate,
     };
@@ -84,7 +79,6 @@ router.post("/", async (req: Request, res: Response): Promise<void> => {
           insertedId: result.insertedId,
         });
     } catch (insertError: unknown) {
-      // Put the copy back if saving the borrow failed
       await books.updateOne(
         { _id: bookObjectId },
         { $inc: { availableCopies: 1 } },
@@ -96,17 +90,17 @@ router.post("/", async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-// GET /borrows?email=...  -> borrows of one user
+// GET /borrows  -> borrows of the logged in user
 router.get("/", async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email } = req.query;
-    if (typeof email !== "string" || !email) {
-      sendError(res, 400, "User email is required");
+    const user = req.user;
+    if (!user) {
+      sendError(res, 401, "Unauthorized");
       return;
     }
 
     const list: Borrow[] = await getBorrowsCollection()
-      .find({ userEmail: email })
+      .find({ userEmail: user.email })
       .sort({ borrowDate: -1 })
       .toArray();
 
@@ -116,24 +110,24 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-// DELETE /borrows/:id?email=...  -> return a book
+// DELETE /borrows/:id  -> return a book
 router.delete("/:id", async (req: Request, res: Response): Promise<void> => {
   try {
-    const id: string = String(req.params.id);
-    const { email } = req.query;
-
-    if (!isValidId(id)) {
-      sendError(res, 400, "Invalid borrow id");
+    const user = req.user;
+    if (!user) {
+      sendError(res, 401, "Unauthorized");
       return;
     }
-    if (typeof email !== "string" || !email) {
-      sendError(res, 400, "User email is required");
+
+    const id: string = String(req.params.id);
+    if (!isValidId(id)) {
+      sendError(res, 400, "Invalid borrow id");
       return;
     }
 
     const borrow = await getBorrowsCollection().findOneAndDelete({
       _id: new ObjectId(id),
-      userEmail: email,
+      userEmail: user.email,
     });
 
     if (!borrow) {
@@ -141,7 +135,6 @@ router.delete("/:id", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Increase copies by 1 when the book is returned
     await getBooksCollection().updateOne(
       { _id: borrow.bookId },
       { $inc: { availableCopies: 1 } },
