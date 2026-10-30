@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { connectDB } from "./db";
 
 dotenv.config();
 
@@ -14,6 +15,16 @@ app.get("/", (_req: Request, res: Response): void => {
   res.json({ message: "BookNook server is running" });
 });
 
-app.listen(port, (): void => {
-  console.log(`BookNook server listening on port ${port}`);
-});
+async function startServer(): Promise<void> {
+  try {
+    await connectDB();
+    app.listen(port, (): void => {
+      console.log(`BookNook server listening on port ${port}`);
+    });
+  } catch (error: unknown) {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  }
+}
+
+void startServer();
