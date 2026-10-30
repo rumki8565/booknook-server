@@ -1,6 +1,7 @@
+import { verifyToken } from "../middleware/auth";
 import { Router, Request, Response } from "express";
 import { Filter, ObjectId } from "mongodb";
-import { getBooksCollection } from "../db";
+import { getBooksCollection, getBorrowsCollection } from "../db";
 import { Book, BookCategory } from "../types";
 import { handleError, isValidId, sendError } from "../utils";
 
@@ -103,116 +104,149 @@ router.get("/:id", async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-// POST /books
-router.post("/", async (req: Request, res: Response): Promise<void> => {
-  try {
-    const body = (req.body ?? {}) as Record<string, unknown>;
-    const fields = validateBook(body);
-    if (typeof fields === "string") {
-      sendError(res, 400, fields);
-      return;
+// POST /books  (protected)
+router.post(
+  "/",
+  verifyToken,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const user = req.user;
+      if (!user) {
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+
+      const fields = validateBook((req.body ?? {}) as Record<string, unknown>);
+      if (typeof fields === "string") {
+        sendError(res, 400, fields);
+        return;
+      }
+
+      const newBook: Book = {
+        ...fields,
+        availableCopies: fields.totalCopies,
+        addedByName: user.name,
+        addedByEmail: user.email,
+        createdAt: new Date(),
+      };
+
+      const result = await getBooksCollection().insertOne(newBook);
+      res
+        .status(201)
+        .json({
+          message: "Book added successfully",
+          insertedId: result.insertedId,
+        });
+    } catch (error: unknown) {
+      handleError(res, error);
     }
+  },
+);
 
-    const { addedByName, addedByEmail } = body;
-    if (
-      typeof addedByName !== "string" ||
-      !addedByName.trim() ||
-      typeof addedByEmail !== "string" ||
-      !addedByEmail.trim()
-    ) {
-      sendError(res, 400, "User name and email are required");
-      return;
-    }
+// PATCH /books/:id  (protected, only the owner)
+router.patch(
+  "/:id",
+  verifyToken,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const user = req.user;
+      if (!user) {
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
 
-    const newBook: Book = {
-      ...fields,
-      availableCopies: fields.totalCopies,
-      addedByName: addedByName.trim(),
-      addedByEmail: addedByEmail.trim(),
-      createdAt: new Date(),
-    };
+      const id: string = String(req.params.id);
+      if (!isValidId(id)) {
+        sendError(res, 400, "Invalid book id");
+        return;
+      }
 
-    const result = await getBooksCollection().insertOne(newBook);
-    res
-      .status(201)
-      .json({
-        message: "Book added successfully",
-        insertedId: result.insertedId,
-      });
-  } catch (error: unknown) {
-    handleError(res, error);
-  }
-});
+      const fields = validateBook((req.body ?? {}) as Record<string, unknown>);
+      if (typeof fields === "string") {
+        sendError(res, 400, fields);
+        return;
+      }
 
-// PATCH /books/:id
-router.patch("/:id", async (req: Request, res: Response): Promise<void> => {
-  try {
-    const id: string = String(req.params.id);
-    if (!isValidId(id)) {
-      sendError(res, 400, "Invalid book id");
-      return;
-    }
+      const books = getBooksCollection();
+      const _id = new ObjectId(id);
 
-    const fields = validateBook((req.body ?? {}) as Record<string, unknown>);
-    if (typeof fields === "string") {
-      sendError(res, 400, fields);
-      return;
-    }
+      const book = await books.findOne({ _id });
+      if (!book) {
+        sendError(res, 404, "Book not found");
+        return;
+      }
+      if (book.addedByEmail !== user.email) {
+        sendError(res, 403, "You can only edit your own books");
+        return;
+      }
 
-    const books = getBooksCollection();
-    const _id = new ObjectId(id);
+      const borrowedNow: number = book.totalCopies - book.availableCopies;
+      if (fields.totalCopies < borrowedNow) {
+        sendError(
+          res,
+          400,
+          `${borrowedNow} copies are borrowed right now, so total copies cannot be less than ${borrowedNow}`,
+        );
+        return;
+      }
 
-    const book = await books.findOne({ _id });
-    if (!book) {
-      sendError(res, 404, "Book not found");
-      return;
-    }
-
-    // Copies that are currently borrowed must stay covered by the new total
-    const borrowedNow: number = book.totalCopies - book.availableCopies;
-    if (fields.totalCopies < borrowedNow) {
-      sendError(
-        res,
-        400,
-        `${borrowedNow} copies are borrowed right now, so total copies cannot be less than ${borrowedNow}`,
+      await books.updateOne(
+        { _id },
+        {
+          $set: {
+            ...fields,
+            availableCopies: fields.totalCopies - borrowedNow,
+          },
+        },
       );
-      return;
+
+      res.json({ message: "Book updated successfully" });
+    } catch (error: unknown) {
+      handleError(res, error);
     }
+  },
+);
 
-    await books.updateOne(
-      { _id },
-      {
-        $set: { ...fields, availableCopies: fields.totalCopies - borrowedNow },
-      },
-    );
+// DELETE /books/:id  (protected, only the owner)
+router.delete(
+  "/:id",
+  verifyToken,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const user = req.user;
+      if (!user) {
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
 
-    res.json({ message: "Book updated successfully" });
-  } catch (error: unknown) {
-    handleError(res, error);
-  }
-});
+      const id: string = String(req.params.id);
+      if (!isValidId(id)) {
+        sendError(res, 400, "Invalid book id");
+        return;
+      }
 
-// DELETE /books/:id
-router.delete("/:id", async (req: Request, res: Response): Promise<void> => {
-  try {
-    const id: string = String(req.params.id);
-    if (!isValidId(id)) {
-      sendError(res, 400, "Invalid book id");
-      return;
+      const books = getBooksCollection();
+      const _id = new ObjectId(id);
+
+      const book = await books.findOne({ _id });
+      if (!book) {
+        sendError(res, 404, "Book not found");
+        return;
+      }
+      if (book.addedByEmail !== user.email) {
+        sendError(res, 403, "You can only delete your own books");
+        return;
+      }
+
+      await books.deleteOne({ _id });
+      // Remove borrow records of this book so My Borrows has no broken rows
+      await getBorrowsCollection().deleteMany({ bookId: _id });
+
+      res.json({ message: "Book deleted successfully" });
+    } catch (error: unknown) {
+      handleError(res, error);
     }
-
-    const result = await getBooksCollection().deleteOne({
-      _id: new ObjectId(id),
-    });
-    if (result.deletedCount === 0) {
-      sendError(res, 404, "Book not found");
-      return;
-    }
-
-    res.json({ message: "Book deleted successfully" });
-  } catch (error: unknown) {
-    handleError(res, error);
-  }
-});
+  },
+);
 
 export default router;
